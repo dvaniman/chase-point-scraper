@@ -1,0 +1,51 @@
+# Chase point scraper — config template.
+# Copy to config.yaml and fill in your account names and last-4 digits (no passwords here).
+
+chase:
+  login_url: "https://secure.chase.com/"
+  dashboard_url: "https://secure.chase.com/web/auth/dashboard#/dashboard/overview"
+  account_selector_url: "https://ultimaterewardspoints.chase.com/account-selector"
+  # rewards_activity_url: "https://..."
+  login_timeout: 120
+
+# Last 4 digits of each card (used to select the right account on the account-selector page).
+# Replace XXXX with your actual last 4 digits; leave "" if you don't use that account.
+account_last4:
+  "Account One": "XXXX"
+  "Account Two": ""
+  "Account Three": "XXXX"
+
+# Browser profile group for 2FA: accounts in the same group share one profile (2FA once per group).
+profile_group:
+  "Account One": "Group_A"
+  "Account Two": "Group_A"
+  "Account Three": "Group_B"
+
+selectors:
+  activity_table: "table, [role='grid'], .activity-table, [data-testid*='activity'], [class*='transaction'], [class*='activity']"
+  header_row: "thead tr, [role='row']:first-child, tr:first-child"
+  data_rows: "tbody tr, [role='row']:not(:first-child)"
+  account_name: "[data-account-name], .account-name, .card-name, h1, h2"
+
+# Account names shown in the terminal menu (match keys in account_last4 and account_credentials).
+account_choices:
+  - Account One
+  - Account Two
+  - Account Three
+
+# Which env vars hold username/password for each account (see .env.example).
+account_credentials:
+  "Account One":   { "username_env": "CHASE_USER_GROUP_A", "password_env": "CHASE_PASSWORD_GROUP_A" }
+  "Account Two":  { "username_env": "CHASE_USER_GROUP_A", "password_env": "CHASE_PASSWORD_GROUP_A" }
+  "Account Three": { "username_env": "CHASE_USER_GROUP_B", "password_env": "CHASE_PASSWORD_GROUP_B" }
+
+output:
+  default_format: "csv"
+  columns:
+    - Date
+    - Account Name
+    - Payee
+    - Type
+    - EarnX
+    - Dollars
+    - Points

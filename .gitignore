@@ -1,0 +1,32 @@
+# Chase point scraper — keep credentials and data out of the repo
+
+# Credentials and account-specific config (use .env.example and config.example.yaml)
+.env
+.env.local
+.env.*.local
+config.yaml
+
+# Scraped output and debug dumps (may contain sensitive page HTML)
+output/
+*.xlsx
+*.csv
+
+# Browser profiles and session state (cookies, 2FA) — never commit
+session/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Optional: spec/history (uncomment if you don't want these in repo)
+# .specstory/
