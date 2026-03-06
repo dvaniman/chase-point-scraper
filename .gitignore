@@ -30,3 +30,11 @@ Thumbs.db
 
 # Optional: spec/history (uncomment if you don't want these in repo)
 # .specstory/
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec
+Chase Point Scraper.exe
+.specstory/
+.cursorindexingignore
