@@ -18,6 +18,17 @@ python scraper_gui.py
 Same as main branch: `.env` and `config.yaml` (from `.env.example` and `config.example.yaml`).  
 `CHASE_HEADED=1` is recommended so you can complete 2FA in the visible browser.
 
+## Building the executable
+
+From the project folder (with dependencies installed):
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name "Chase Point Scraper" scraper_gui.py
+```
+
+The executable is at `dist\Chase Point Scraper.exe`. Put `config.yaml` and `.env` in the same folder as the `.exe` (or run from that folder).
+
 ## Notes
 
 - The GUI runs the same `scraper.run_scraper(accounts=...)` as the CLI; only the launcher and output/input are different.

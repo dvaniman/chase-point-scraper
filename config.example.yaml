@@ -26,6 +26,9 @@ selectors:
   header_row: "thead tr, [role='row']:first-child, tr:first-child"
   data_rows: "tbody tr, [role='row']:not(:first-child)"
   account_name: "[data-account-name], .account-name, .card-name, h1, h2"
+  # Optional: comma-separated CSS selectors for the total points balance (helps if auto-detect fails).
+  # Example: "mds-heading[variant='title-1'], [class*='balance']"
+  points_balance: ""
 
 # Account names shown in the terminal menu (match keys in account_last4 and account_credentials).
 account_choices:
@@ -40,6 +43,10 @@ account_credentials:
   "Account Three": { "username_env": "CHASE_USER_GROUP_B", "password_env": "CHASE_PASSWORD_GROUP_B" }
 
 output:
+  # Append one row per successful run: when scraped, account name, total points balance.
+  # File: output/balance_history.xlsx (sheet "Balance history") or .csv if openpyxl missing.
+  record_balance_each_run: true
+  balance_history_file: "balance_history.xlsx"
   default_format: "csv"
   columns:
     - Date

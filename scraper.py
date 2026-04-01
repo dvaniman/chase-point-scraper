@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import csv
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 
@@ -134,6 +135,386 @@ def _parse_rows_with_header_map(header_cell_texts, data_rows, get_cell_texts):
     return out
 
 
+def _parse_balance_int(text):
+    """Extract a points balance integer from text like '125,430 pts' or '125430'."""
+    if not text:
+        return None
+    m = re.search(r"([\d,]+)\s*(?:points?|pts)\b", text, re.I)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    m = re.search(r"\b([\d]{1,3}(?:,\d{3})+)\b", text)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def _balance_js_selector():
+    """
+    JS: get balance from selector page (shadow DOM). Returns int or { balance: null, itemCount, labels, snippet } for debug.
+    Tries multiple patterns: "Available Points: N pts", "available points", "N pts" near "available", etc.
+    """
+    return r"""
+    (last4) => {
+        function allText(node) {
+            if (!node) return '';
+            if (node.nodeType === 3) return node.textContent || '';
+            let s = '';
+            if (node.shadowRoot) s += allText(node.shadowRoot);
+            const ch = node.childNodes;
+            if (ch) for (let i = 0; i < ch.length; i++) s += allText(ch[i]);
+            return s;
+        }
+        const L = (last4 || '').trim();
+        const items = document.querySelectorAll('mds-list-item');
+        const labels = [];
+        for (let i = 0; i < items.length; i++) {
+            const lab = (items[i].getAttribute('label') || '');
+            labels.push(lab ? lab.substring(0, 80) : '(no label)');
+        }
+        let snippet = '';
+        for (let i = 0; i < items.length; i++) {
+            const el = items[i];
+            const lab = (el.getAttribute('label') || '');
+            if (L && lab.indexOf(L) === -1) continue;
+            const txt = allText(el).replace(/\s+/g, ' ');
+            snippet = txt.substring(0, 1500);
+            const patterns = [
+                /Available\s+Points:\s*([\d,]+)\s*pts?/i,
+                /available\s+points:\s*([\d,]+)/i,
+                /([\d,]+)\s*pts?\s*available/i,
+                /([\d,]{2,})\s*pts?/,
+                /points?\s*[:\s]*([\d,]+)/i
+            ];
+            for (const re of patterns) {
+                const m = txt.match(re);
+                if (m) {
+                    const num = parseInt(m[1].replace(/,/g, ''), 10);
+                    if (num >= 1 && num < 1e8) return num;
+                }
+            }
+        }
+        const body = allText(document.body).replace(/\s+/g, ' ');
+        if (!snippet) snippet = body.substring(0, 2000);
+        for (const re of [/Available\s+Points:\s*([\d,]+)\s*pts?/gi, /([\d,]+)\s*pts?\s*available/gi]) {
+            let m;
+            while ((m = re.exec(body)) !== null) {
+                const num = parseInt(m[1].replace(/,/g, ''), 10);
+                if (num >= 100 && num < 1e8) return num;
+            }
+        }
+        return { balance: null, itemCount: items.length, labels: labels, snippet: snippet };
+    }
+    """
+
+
+def scrape_balance_from_selector_page(page, last4: str):
+    """
+    On the account selector page, find the card for last4 and parse Available Points.
+    Chase puts the balance in the mds-list-item **description** attribute, e.g.
+    description="Available Points: 87,651 pts" (not shadow-DOM text).
+    """
+    if not (last4 or "").strip():
+        return None
+
+    def parse_balance_from_text(text):
+        if not text:
+            return None
+        m = re.search(r"Available\s+Points:\s*([\d,]+)\s*pts?", text, re.I)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+        return _parse_balance_int(text)
+
+    # Primary: description attribute on the matching card (Chase light DOM)
+    try:
+        card = page.locator(f'mds-list-item[label*="{last4}"]').first
+        card.wait_for(state="attached", timeout=12000)
+        desc = (card.get_attribute("description") or "").strip()
+        n = parse_balance_from_text(desc)
+        if n is not None:
+            return n
+    except Exception as e:
+        print(f"[Balance debug] description attribute: {e}")
+        sys.stdout.flush()
+
+    try:
+        page.wait_for_timeout(800)
+        result = page.evaluate(_balance_js_selector(), last4)
+        if result is None:
+            pass
+        elif isinstance(result, dict):
+            if result.get("balance") is not None:
+                try:
+                    n = int(float(result["balance"]))
+                    if n >= 1:
+                        return n
+                except (TypeError, ValueError):
+                    pass
+            snippet = result.get("snippet") or ""
+            item_count = result.get("itemCount", 0)
+            labels = result.get("labels") or []
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            debug_path = OUTPUT_DIR / "balance_debug_selector.txt"
+            debug_path.write_text(snippet, encoding="utf-8")
+            print(
+                f"[Balance debug] Selector page: {item_count} card(s), labels: {labels!r}. "
+                f"Page text written to {debug_path}"
+            )
+            sys.stdout.flush()
+        else:
+            try:
+                n = int(float(result))
+                if n >= 1:
+                    return n
+            except (TypeError, ValueError):
+                pass
+    except Exception as e:
+        print(f"[Balance debug] Selector page JS error: {e}")
+        sys.stdout.flush()
+
+    try:
+        card = page.locator(f'mds-list-item[label*="{last4}"]').first
+        card.wait_for(state="attached", timeout=5000)
+        text = card.inner_text() or ""
+        n = parse_balance_from_text(text)
+        if n is not None:
+            return n
+    except Exception as e:
+        print(f"[Balance debug] Selector page inner_text: {e}")
+        sys.stdout.flush()
+
+    try:
+        content = page.content() or ""
+        if last4 not in content:
+            print(f"[Balance debug] last4 {last4!r} not found in page HTML.")
+            sys.stdout.flush()
+        else:
+            for m in re.finditer(r"Available\s+Points:\s*([\d,]+)\s*pts?", content, re.I):
+                try:
+                    return int(m.group(1).replace(",", ""))
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"[Balance debug] page.content(): {e}")
+        sys.stdout.flush()
+    return None
+
+
+def scrape_balance_from_activity_page(page):
+    """
+    After activity loads, total points often appears once on page (including shadow DOM).
+    """
+    try:
+        page.wait_for_timeout(500)
+        result = page.evaluate(r"""() => {
+            function allText(node) {
+                if (!node) return '';
+                if (node.nodeType === 3) return node.textContent || '';
+                let s = '';
+                if (node.shadowRoot) s += allText(node.shadowRoot);
+                const ch = node.childNodes;
+                if (ch) for (let i = 0; i < ch.length; i++) s += allText(ch[i]);
+                return s;
+            }
+            const body = allText(document.body).replace(/\s+/g, ' ');
+            const matches = [];
+            let re = /Available\s+Points:\s*([\d,]+)\s*pts?/gi;
+            let m;
+            while ((m = re.exec(body)) !== null) {
+                matches.push(parseInt(m[1].replace(/,/g, ''), 10));
+            }
+            if (matches.length >= 1) return Math.max.apply(null, matches);
+            const reBal = /(balance|available|total|you have)[^0-9]{0,40}([\d,]{2,})\s*pts?/gi;
+            const bal = [];
+            while ((m = reBal.exec(body)) !== null) {
+                const v = parseInt(m[2].replace(/,/g, ''), 10);
+                if (v >= 100) bal.push(v);
+            }
+            if (bal.length === 1) return bal[0];
+            if (bal.length > 1) return Math.max.apply(null, bal);
+            return { balance: null, snippet: body.substring(0, 2000) };
+        }""")
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            debug_path = OUTPUT_DIR / "balance_debug_activity.txt"
+            debug_path.write_text(result.get("snippet") or "", encoding="utf-8")
+            print(f"[Balance debug] Activity page: no balance pattern. Wrote {debug_path}")
+            sys.stdout.flush()
+            return None
+        try:
+            n = int(float(result))
+            if n >= 100:
+                return n
+        except (TypeError, ValueError):
+            pass
+    except Exception as e:
+        print(f"[Balance debug] Activity page error: {e}")
+        sys.stdout.flush()
+    return None
+
+
+def scrape_points_balance(page, config):
+    """
+    Read current Ultimate Rewards points balance from the page.
+    Tries config selectors first, then contextual regex (balance / available / you have).
+    Returns int or None.
+    """
+    selectors = config.get("selectors", {})
+    raw = (selectors.get("points_balance") or "").strip()
+    for sel in [s.strip() for s in raw.split(",") if s.strip()]:
+        try:
+            for el in page.query_selector_all(sel):
+                t = (el.inner_text() or "").strip()
+                if not t or len(t) > 500:
+                    continue
+                n = _parse_balance_int(t)
+                if n is not None and n >= 1:
+                    return n
+        except Exception:
+            continue
+    try:
+        text = page.inner_text() or ""
+        # Prefer numbers near balance-related wording
+        for m in re.finditer(
+            r".{0,80}(\d{1,3}(?:,\d{3})+)\s*(?:points|pts)\b.{0,80}",
+            text[:20000],
+            re.I | re.DOTALL,
+        ):
+            chunk = m.group(0).lower()
+            if any(
+                w in chunk
+                for w in (
+                    "balance",
+                    "available",
+                    "total",
+                    "you have",
+                    "rewards balance",
+                    "point balance",
+                    "current",
+                )
+            ):
+                try:
+                    return int(m.group(1).replace(",", ""))
+                except ValueError:
+                    continue
+        # Last resort: largest plausible account balance (exclude tiny per-txn amounts)
+        candidates = []
+        for m in re.finditer(r"(\d{1,3}(?:,\d{3})+)\s*(?:points|pts)\b", text[:12000], re.I):
+            try:
+                v = int(m.group(1).replace(",", ""))
+                if v >= 1000:
+                    candidates.append(v)
+            except ValueError:
+                continue
+        if candidates:
+            return max(candidates)
+    except Exception:
+        pass
+    return None
+
+
+def append_balance_snapshot(account_name: str, balance: int, config: dict) -> Path | None:
+    """
+    Append one row: when scraped, which account, points balance.
+    Single file for all accounts — filter or pivot by Account Name in Excel.
+    """
+    out_cfg = config.get("output", {})
+    if not out_cfg.get("record_balance_each_run", True):
+        return None
+    name = (out_cfg.get("balance_history_file") or "balance_history").strip()
+    if not name.endswith(".xlsx") and not name.endswith(".csv"):
+        name += ".xlsx"
+    path = OUTPUT_DIR / name
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    headers = ["Snapshot At", "Account Name", "Points Balance"]
+    row = [now, account_name, balance]
+
+    if path.suffix.lower() == ".csv":
+        new_file = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(headers)
+            w.writerow(row)
+        return path
+
+    try:
+        import openpyxl
+    except ImportError:
+        csv_path = path.with_suffix(".csv")
+        new_file = not csv_path.exists()
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(headers)
+            w.writerow(row)
+        return csv_path
+
+    if path.exists():
+        wb = openpyxl.load_workbook(path)
+        if "Balance history" in wb.sheetnames:
+            ws = wb["Balance history"]
+        else:
+            ws = wb.create_sheet("Balance history", 0)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Balance history"
+    if ws.max_row == 0:
+        ws.append(headers)
+    ws.append(row)
+    wb.save(path)
+    wb.close()
+    return path
+
+
+def ensure_balance_history_file(config: dict) -> Path:
+    """
+    Create balance_history file with headers if it doesn't exist, so the file
+    is present in output/ even before the first balance is recorded.
+    """
+    out_cfg = config.get("output", {})
+    if not out_cfg.get("record_balance_each_run", True):
+        return OUTPUT_DIR / "balance_history.xlsx"
+    name = (out_cfg.get("balance_history_file") or "balance_history").strip()
+    if not name.endswith(".xlsx") and not name.endswith(".csv"):
+        name += ".xlsx"
+    path = OUTPUT_DIR / name
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path
+    headers = ["Snapshot At", "Account Name", "Points Balance"]
+    if path.suffix.lower() == ".csv":
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(headers)
+        return path
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Balance history"
+        ws.append(headers)
+        wb.save(path)
+        wb.close()
+    except ImportError:
+        csv_path = path.with_suffix(".csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(headers)
+        return csv_path
+    return path
+
+
 def scrape_table_and_account(page, config):
     """Find activity table and optional account name on the current page."""
     selectors = config.get("selectors", {})
@@ -186,7 +567,7 @@ def scrape_table_and_account(page, config):
             dollars = (sec_desc or "").replace("$", "").replace(",", "").strip()
             points = (sec_label or "").replace(" pts", "").replace("pts", "").replace(",", "").strip()
             row = {
-                "Date": date_str,
+                "Date": normalize_date_str(date_str) or date_str,
                 "Payee": label,
                 "Type": "Earn" if "earn" in earn_str.lower() else "",
                 "EarnX": earn_x,
@@ -298,26 +679,78 @@ def _account_file_path(account_name: str) -> Path:
     return OUTPUT_DIR / f"{safe}.xlsx"
 
 
+# Canonical date format for storage and dedupe (YYYY-MM-DD)
+DATE_FMT_CANONICAL = "%Y-%m-%d"
+DATE_INPUT_FORMATS = [
+    "%Y-%m-%d %H:%M:%S",  # 2025-09-15 00:00:00 (Excel datetime)
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d",
+    "%b %d, %Y",   # Mar 1, 2026
+    "%B %d, %Y",   # March 1, 2026
+    "%m/%d/%Y",    # 03/01/2026
+    "%m-%d-%Y",    # 03-01-2026
+    "%d/%m/%Y",    # 01/03/2026
+    "%b %d, %y",   # Mar 1, 26
+]
+
+
+def normalize_date_str(s: str) -> str:
+    """
+    Parse common date strings and return YYYY-MM-DD for consistent sorting and dedupe.
+    Handles Excel-style "2025-09-15 00:00:00". Returns original string if unparseable.
+    """
+    s = (s or "").strip()
+    if not s:
+        return s
+    # Strip Excel serial or trailing time so we only parse the date part
+    s_trim = s[:50].strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", s_trim):
+        s_trim = s_trim[:10]
+    for fmt in DATE_INPUT_FORMATS:
+        try:
+            dt = datetime.strptime(s_trim, fmt)
+            return dt.strftime(DATE_FMT_CANONICAL)
+        except ValueError:
+            continue
+    # Try stripping trailing year shorthand (e.g. "Mar 1, 20" -> assume 2020)
+    m = re.match(r"^(\w+\s+\d{1,2}),\s*(\d{2})$", s.strip())
+    if m:
+        try:
+            dt = datetime.strptime(f"{m.group(1)}, 20{m.group(2)}", "%b %d, %Y")
+            return dt.strftime(DATE_FMT_CANONICAL)
+        except ValueError:
+            pass
+    return s
+
+
 def _date_sort_key(row: dict) -> tuple:
-    """Sort key for date order (chronological = oldest first). Parsed date or (9999,99,99) for unparseable."""
+    """Sort key for date order (chronological = oldest first). Uses normalized date when possible."""
     s = str(row.get("Date", "")).strip()
     if not s:
         return (9999, 99, 99)
-    try:
-        dt = datetime.strptime(s, "%b %d, %Y")  # e.g. Mar 1, 2026
-        return (dt.year, dt.month, dt.day)
-    except ValueError:
+    normalized = normalize_date_str(s)
+    if normalized != s and re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
         try:
-            dt = datetime.strptime(s, "%m/%d/%Y")
+            dt = datetime.strptime(normalized, DATE_FMT_CANONICAL)
             return (dt.year, dt.month, dt.day)
         except ValueError:
-            return (9999, 99, 99)
+            pass
+    for fmt in DATE_INPUT_FORMATS + [DATE_FMT_CANONICAL]:
+        try:
+            dt = datetime.strptime(s[:50], fmt)
+            return (dt.year, dt.month, dt.day)
+        except ValueError:
+            continue
+    return (9999, 99, 99)
 
 
 def _row_key(row: dict) -> tuple:
-    """Key for deduplication: same Date, Payee, Dollars, Points = same transaction."""
+    """Key for deduplication: same Date (normalized), Payee, Dollars, Points = same transaction."""
+    date_val = str(row.get("Date", "")).strip()
+    if date_val and re.match(r"^\d{4}-\d{2}-\d{2}$", normalize_date_str(date_val)):
+        date_val = normalize_date_str(date_val)
     return (
-        str(row.get("Date", "")),
+        date_val,
         str(row.get("Payee", "")),
         str(row.get("Dollars", "")),
         str(row.get("Points", "")),
@@ -361,25 +794,218 @@ def load_existing_rows(path: Path, column_order: list) -> list:
     return out
 
 
-def merge_and_save(rows: list, account_name: str, column_order: list) -> tuple:
+def backfill_balance_sheets(config=None):
     """
-    Merge new rows into the account's ongoing file; only append transactions not already present.
-    Sorted by date (chronological). Saves as xlsx.
-    Returns (path, num_new, num_skipped).
+    One-time: copy latest balance from balance_history.xlsx into each account workbook
+    that is missing a 'Balance' sheet (e.g. Ink Pref.xlsx).
     """
+    config = config or load_config()
+    out_cfg = config.get("output", {})
+    name = (out_cfg.get("balance_history_file") or "balance_history").strip()
+    if not name.endswith(".xlsx"):
+        name += ".xlsx"
+    hist_path = OUTPUT_DIR / name
+    if not hist_path.exists():
+        print("No balance_history file found; run the scraper once with balance capture.")
+        return
+    try:
+        import openpyxl
+    except ImportError:
+        print("openpyxl required. pip install openpyxl")
+        return
+    latest_by_account = {}
+    try:
+        wb = openpyxl.load_workbook(hist_path, read_only=True, data_only=True)
+        ws = wb["Balance history"] if "Balance history" in wb.sheetnames else wb.active
+        headers = [ws.cell(1, c).value for c in range(1, 4)]
+        snap_col = 1
+        account_col = 2
+        balance_col = 3
+        for c, h in enumerate(headers, 1):
+            if h and "snapshot" in str(h).lower():
+                snap_col = c
+            if h and "account" in str(h).lower():
+                account_col = c
+            if h and "balance" in str(h).lower() and "point" in str(h).lower():
+                balance_col = c
+        for row in range(2, ws.max_row + 1):
+            acc = ws.cell(row, account_col).value
+            bal = ws.cell(row, balance_col).value
+            snap = ws.cell(row, snap_col).value
+            if acc and bal is not None:
+                try:
+                    b = int(float(bal))
+                    if row > latest_by_account.get(acc, (0, None, None))[0]:
+                        latest_by_account[acc] = (row, str(snap or ""), b)
+                except (TypeError, ValueError):
+                    pass
+        wb.close()
+    except Exception as e:
+        print("Could not read balance_history:", e)
+        return
+    for path in OUTPUT_DIR.glob("*.xlsx"):
+        if path.name.startswith("~") or path.suffix.lower() != ".xlsx":
+            continue
+        if path.name.lower().startswith("balance_history"):
+            continue
+        account_name = path.stem.replace("_", " ")
+        if account_name not in latest_by_account:
+            continue
+        _, snapshot_at, balance = latest_by_account[account_name]
+        try:
+            wb = openpyxl.load_workbook(path)
+            if "Balance" in wb.sheetnames:
+                wb.close()
+                continue
+            ws_bal = wb.create_sheet("Balance", 1)
+            ws_bal.cell(1, 1, "Snapshot At")
+            ws_bal.cell(1, 2, "Points Balance")
+            ws_bal.cell(2, 1, snapshot_at)
+            ws_bal.cell(2, 2, balance)
+            wb.save(path)
+            wb.close()
+            print(f"Added Balance sheet to {path.name} (balance {balance:,})")
+        except Exception as e:
+            print(f"Skip {path.name}: {e}")
+    print("Backfill done.")
+
+
+def cleanup_existing_date_formats(config=None):
+    """
+    One-time cleanup: normalize all Date cells in existing account xlsx files under output/
+    to YYYY-MM-DD (fixes Excel datetimes like 2025-09-15 00:00:00 and mixed formats).
+    """
+    config = config or load_config()
+    column_order = config.get("output", {}).get("columns") or [
+        "Date", "Account Name", "Payee", "Type", "EarnX", "Dollars", "Points"
+    ]
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    xlsx_files = list(OUTPUT_DIR.glob("*.xlsx"))
+    try:
+        import openpyxl
+    except ImportError:
+        print("openpyxl required for date cleanup. pip install openpyxl")
+        return
+    for path in xlsx_files:
+        if path.name.startswith("~"):
+            continue
+        try:
+            wb = openpyxl.load_workbook(path, data_only=False)
+            changed = False
+            for sheet_name in wb.sheetnames:
+                if sheet_name == "Balance":
+                    continue
+                ws = wb[sheet_name]
+                if ws.max_row < 2:
+                    continue
+                headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+                date_col = None
+                for col, h in enumerate(headers, 1):
+                    if h and "date" in str(h).lower():
+                        date_col = col
+                        break
+                if date_col is None:
+                    continue
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=date_col)
+                    val = cell.value
+                    if val is None:
+                        continue
+                    s = str(val).strip()
+                    if not s:
+                        continue
+                    normalized = normalize_date_str(s)
+                    if normalized != s and re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
+                        cell.value = normalized
+                        changed = True
+            if changed:
+                wb.save(path)
+                print(f"Cleaned dates in {path.name}")
+            wb.close()
+        except Exception as e:
+            print(f"Skip {path.name}: {e}")
+    print("Date cleanup done.")
+
+
+def _normalize_row_dates(rows: list) -> None:
+    """In-place: set each row's Date to canonical YYYY-MM-DD for consistent sort and dedupe."""
+    for r in rows:
+        d = r.get("Date")
+        if d is not None and str(d).strip():
+            r["Date"] = normalize_date_str(str(d).strip())
+
+def merge_and_save(rows: list, account_name: str, column_order: list, balance: int | None = None) -> tuple:
+    """
+    Merge new rows into the account's ongoing file. Allows multiple rows with the same
+    (Date, Payee, Dollars, Points) so legitimate duplicate transactions are all kept.
+    Dates normalized to YYYY-MM-DD. If balance is provided, writes it to a 'Balance' sheet
+    in the same workbook. Returns (path, num_new, num_skipped).
+    """
+    set_earn_x_from_points_dollars(rows)
+    _normalize_row_dates(rows)
     path = _account_file_path(account_name)
     existing = load_existing_rows(path, column_order)
-    existing_keys = {_row_key(r) for r in existing}
+    set_earn_x_from_points_dollars(existing)
+    _normalize_row_dates(existing)
+    existing_key_counts = Counter(_row_key(r) for r in existing)
     new_rows = []
     for r in rows:
-        if _row_key(r) not in existing_keys:
-            new_rows.append(r)
-            existing_keys.add(_row_key(r))
+        key = _row_key(r)
+        if existing_key_counts[key] > 0:
+            existing_key_counts[key] -= 1
+            continue
+        new_rows.append(r)
     combined = existing + new_rows
     combined.sort(key=_date_sort_key)
+    balance_snapshot = (datetime.now().isoformat(timespec="seconds"), balance) if balance is not None else None
     if combined:
-        export_xlsx(combined, path)
+        export_xlsx(combined, path, balance_snapshot=balance_snapshot)
+        if balance_snapshot is not None:
+            _ensure_balance_sheet_in_workbook(path, balance_snapshot[0], balance_snapshot[1])
+    elif balance_snapshot and path.exists():
+        # No transaction rows but we have a balance: update only the Balance sheet
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path)
+            if "Balance" in wb.sheetnames:
+                ws_bal = wb["Balance"]
+            else:
+                ws_bal = wb.create_sheet("Balance", 1)
+            ws_bal.cell(row=1, column=1, value="Snapshot At")
+            ws_bal.cell(row=1, column=2, value="Points Balance")
+            ws_bal.cell(row=2, column=1, value=balance_snapshot[0])
+            ws_bal.cell(row=2, column=2, value=balance_snapshot[1])
+            wb.save(path)
+            wb.close()
+        except Exception:
+            pass
     return path, len(new_rows), len(rows) - len(new_rows)
+
+
+def set_earn_x_from_points_dollars(rows: list) -> None:
+    """
+    Set EarnX from Points/Dollars when both are numeric.
+    Chase sometimes shows '1x' for all; the actual multiplier is points/dollars (e.g. 3x, 2x).
+    Handles Excel-loaded values that may be float/int (coerce to str).
+    """
+    for row in rows:
+        try:
+            d = str(row.get("Dollars") or "").strip().replace("$", "").replace(",", "")
+            p = str(row.get("Points") or "").strip().replace(",", "")
+            if not d or not p:
+                continue
+            dollars = float(d)
+            points = float(p)
+            if dollars <= 0:
+                continue
+            mult = points / dollars
+            mult_rounded = round(mult, 1)
+            if mult_rounded == int(mult_rounded):
+                row["EarnX"] = f"{int(mult_rounded)}x"
+            else:
+                row["EarnX"] = f"{mult_rounded}x"
+        except (ValueError, TypeError):
+            pass
 
 
 def export_csv(rows, path):
@@ -392,7 +1018,29 @@ def export_csv(rows, path):
         w.writerows(rows)
 
 
-def export_xlsx(rows, path):
+def _ensure_balance_sheet_in_workbook(path: Path, snapshot_at: str, balance: int) -> None:
+    """Add or update the 'Balance' sheet in an existing xlsx so the per-account file always has it when we have a balance."""
+    if not path.exists() or path.suffix.lower() != ".xlsx":
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path)
+        if "Balance" in wb.sheetnames:
+            ws_bal = wb["Balance"]
+        else:
+            ws_bal = wb.create_sheet("Balance", 1)
+        ws_bal.cell(row=1, column=1, value="Snapshot At")
+        ws_bal.cell(row=1, column=2, value="Points Balance")
+        ws_bal.cell(row=2, column=1, value=snapshot_at)
+        ws_bal.cell(row=2, column=2, value=balance)
+        wb.save(path)
+        wb.close()
+    except Exception:
+        pass
+
+
+def export_xlsx(rows, path, balance_snapshot=None):
+    """Write transaction rows to first sheet; optionally add/update 'Balance' sheet with (snapshot_at, balance)."""
     if not rows:
         return
     try:
@@ -405,7 +1053,6 @@ def export_xlsx(rows, path):
     ws = wb.active
     ws.title = "Points"
     keys = list(rows[0].keys())
-    # Header row (green style to match your screenshot)
     header_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF")
     for col, key in enumerate(keys, 1):
@@ -415,6 +1062,16 @@ def export_xlsx(rows, path):
     for row_idx, row in enumerate(rows, 2):
         for col_idx, key in enumerate(keys, 1):
             ws.cell(row=row_idx, column=col_idx, value=row.get(key, ""))
+    if balance_snapshot is not None:
+        snapshot_at, balance = balance_snapshot
+        if "Balance" in wb.sheetnames:
+            ws_bal = wb["Balance"]
+        else:
+            ws_bal = wb.create_sheet("Balance", 1)
+        ws_bal.cell(row=1, column=1, value="Snapshot At")
+        ws_bal.cell(row=1, column=2, value="Points Balance")
+        ws_bal.cell(row=2, column=1, value=snapshot_at)
+        ws_bal.cell(row=2, column=2, value=balance)
     wb.save(path)
 
 
@@ -424,6 +1081,9 @@ def run_scraper(output_format=None, accounts=None):
     column_order = config.get("output", {}).get("columns") or [
         "Date", "Account Name", "Payee", "Type", "EarnX", "Dollars", "Points"
     ]
+    balance_path = ensure_balance_history_file(config)
+    print(f"Balance history (when recorded): {balance_path}")
+    sys.stdout.flush()
 
     if accounts is None:
         accounts = prompt_account_menu(config)
@@ -589,7 +1249,7 @@ def run_scraper(output_format=None, accounts=None):
                     on_account_selector = "account-selector" in url and "choose" in content
                     if on_dashboard or on_account_selector:
                         main_page_loaded = True
-                        print("Main page loaded — no 2FA required.")
+                        print("Main page loaded - no 2FA required.")
                         sys.stdout.flush()
                         break
                 if not main_page_loaded:
@@ -622,14 +1282,15 @@ def run_scraper(output_format=None, accounts=None):
                     print("Could not save session:", e)
                     sys.stdout.flush()
             else:
-                print("Using saved session — already logged in.")
+                print("Using saved session - already logged in.")
                 sys.stdout.flush()
     
             # Wait for dashboard if needed, then go to account-selector and select this account by last 4 digits
             dashboard_url = chrome.get("dashboard_url") or "https://secure.chase.com/web/auth/dashboard#/dashboard/overview"
             selector_url = chrome.get("account_selector_url") or "https://ultimaterewardspoints.chase.com/account-selector"
             last4 = (config.get("account_last4") or {}).get(account_name, "").strip()
-    
+            balance_from_selector = None  # captured on selector page before we navigate to activity
+
             try:
                 if "dashboard" not in page.url and "overview" not in page.url:
                     print("Waiting for dashboard...")
@@ -668,14 +1329,35 @@ def run_scraper(output_format=None, accounts=None):
                     # Exact structure from Chase: body.account-selector-container > section.card-section > mds-list > mds-list-item[label="...1827"][href="..."]
                     selected = False
                     try:
-                        page.wait_for_selector("body.account-selector-container section.card-section mds-list-item", timeout=8000)
+                        # "visible" often times out on mds-list-item; "attached" is enough (balance is in description attr)
+                        page.wait_for_selector(
+                            "section.card-section mds-list-item, body.account-selector-container mds-list-item",
+                            state="attached",
+                            timeout=15000,
+                        )
                         page.wait_for_timeout(500)
-                    except Exception:
-                        pass
+                    except Exception as ex:
+                        print(f"[Balance] Selector wait (attached): {ex}")
+                        sys.stdout.flush()
+                    print(f"[Balance] Reading from selector page (last4={last4})...")
+                    sys.stdout.flush()
+                    try:
+                        balance_from_selector = scrape_balance_from_selector_page(page, last4)
+                    except Exception as ex:
+                        print(f"[Balance] Selector scrape error: {ex}")
+                        sys.stdout.flush()
+                        balance_from_selector = None
+                    if balance_from_selector is not None:
+                        print(f"[Balance] Selector page returned: {balance_from_selector:,}")
+                    else:
+                        print("[Balance] Selector page returned: None")
+                    sys.stdout.flush()
                     # Primary: mds-list-item has label and href in light DOM — get href and navigate (no click needed)
                     try:
                         card = page.locator(f'mds-list-item[label*="{last4}"]').first
-                        card.wait_for(state="visible", timeout=6000)
+                        card.wait_for(state="attached", timeout=10000)
+                        if balance_from_selector is None:
+                            balance_from_selector = scrape_balance_from_selector_page(page, last4)
                         href = card.get_attribute("href")
                         if href:
                             page.goto(href, wait_until="load", timeout=20000)
@@ -732,13 +1414,13 @@ def run_scraper(output_format=None, accounts=None):
                             page.wait_for_timeout(2000)
                             selected = True
                         except Exception as e2:
-                            print("Could not select account for digits", last4, "—", e2)
+                            print("Could not select account for digits", last4, "-", e2)
                             sys.stdout.flush()
                             print(">>> Please click the account card in the browser, then press ENTER here to continue.")
                             sys.stdout.flush()
                             input()
                 else:
-                    print("No account_last4 for", account_name, "in config — select account manually.")
+                    print("No account_last4 for", account_name, "in config - select account manually.")
                     sys.stdout.flush()
             except Exception as e:
                 print("Navigation to account selector failed:", e)
@@ -823,7 +1505,34 @@ def run_scraper(output_format=None, accounts=None):
             if rows:
                 rows = add_account_column(rows, account_name)
             rows = ensure_column_order(rows, column_order)
-    
+
+            balance = scrape_points_balance(page, config)
+            if balance is not None:
+                print(f"[Balance] From activity page config/fallback: {balance:,}")
+                sys.stdout.flush()
+            if balance is None and balance_from_selector is not None:
+                balance = balance_from_selector
+                print(f"[Balance] From selector page (saved earlier): {balance:,}")
+                sys.stdout.flush()
+            if balance is None:
+                print("[Balance] Trying activity page shadow-DOM scan...")
+                sys.stdout.flush()
+                balance = scrape_balance_from_activity_page(page)
+                if balance is not None:
+                    print(f"[Balance] From activity page: {balance:,}")
+                    sys.stdout.flush()
+            if balance is not None:
+                bp = append_balance_snapshot(account_name, balance, config)
+                if bp:
+                    print(f"Points balance {balance:,} recorded -> {bp}")
+                    sys.stdout.flush()
+            elif rows:
+                print(
+                    "Could not read points balance. Add selectors.points_balance in config.yaml "
+                    "(CSS to the element showing total points) if this persists."
+                )
+                sys.stdout.flush()
+
             if not rows:
                 debug_path = OUTPUT_DIR / "last_page_debug.html"
                 try:
@@ -871,10 +1580,10 @@ def run_scraper(output_format=None, accounts=None):
     
             context.close()
 
-        # Merge into ongoing file for this account (one file per account); only insert new transactions
+        # Merge into ongoing file for this account (one file per account); include balance in workbook if we have it
         if rows:
             last_rows = rows
-            out_path, num_new, num_skipped = merge_and_save(rows, account_name, column_order)
+            out_path, num_new, num_skipped = merge_and_save(rows, account_name, column_order, balance=balance)
             print(f"Saved to {out_path}: {num_new} new transaction(s) added, {num_skipped} already present.")
             sys.stdout.flush()
 
@@ -882,4 +1591,15 @@ def run_scraper(output_format=None, accounts=None):
 
 
 if __name__ == "__main__":
-    run_scraper()
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].strip().lower()
+        if arg in ("--cleanup-dates", "-c"):
+            print("One-time date cleanup: normalizing Date column to YYYY-MM-DD in all account xlsx files...")
+            cleanup_existing_date_formats()
+        elif arg in ("--backfill-balance", "-b"):
+            print("Backfilling Balance sheet into account workbooks from balance_history.xlsx...")
+            backfill_balance_sheets()
+        else:
+            run_scraper()
+    else:
+        run_scraper()

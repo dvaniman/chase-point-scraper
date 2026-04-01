@@ -40,6 +40,16 @@ python scraper.py
 - On first run (or when Chase asks), complete 2FA in the browser; the script pauses for you.
 - The scraper signs out after each run. Data is merged into one file per account under `output/` (CSV/Excel as configured).
 
+### Points balance over time
+
+Each successful run appends one row to **`output/balance_history.xlsx`** (sheet **Balance history**), or **`balance_history.csv`** if Excel isn’t available:
+
+| Snapshot At        | Account Name | Points Balance |
+|--------------------|--------------|----------------|
+| 2026-03-05T14:32:01 | Sapphire Pref | 125430 |
+
+All accounts share this file so you can **filter by Account Name** or build a simple chart in Excel. Turn off with `record_balance_each_run: false` in `config.yaml`. If the balance is wrong or missing, set **`selectors.points_balance`** in `config.yaml` to a CSS selector that wraps your total points (inspect the rewards page in DevTools).
+
 ## What’s in the repo (templates only)
 
 | File                | Purpose |
